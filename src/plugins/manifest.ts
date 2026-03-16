@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { MANIFEST_KEY } from "../compat/legacy-names.js";
+import { openBoundaryFileSync } from "../infra/boundary-file-read.js";
 import { isRecord } from "../utils.js";
 import type { PluginConfigUiHint, PluginKind } from "./types.js";
 
@@ -13,6 +14,7 @@ export type PluginManifest = {
   kind?: PluginKind;
   channels?: string[];
   providers?: string[];
+  providerAuthEnvVars?: Record<string, string[]>;
   skills?: string[];
   name?: string;
   description?: string;
@@ -31,6 +33,25 @@ function normalizeStringList(value: unknown): string[] {
   return value.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean);
 }
 
+function normalizeStringListRecord(value: unknown): Record<string, string[]> | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const normalized: Record<string, string[]> = {};
+  for (const [key, rawValues] of Object.entries(value)) {
+    const providerId = typeof key === "string" ? key.trim() : "";
+    if (!providerId) {
+      continue;
+    }
+    const values = normalizeStringList(rawValues);
+    if (values.length === 0) {
+      continue;
+    }
+    normalized[providerId] = values;
+  }
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
 export function resolvePluginManifestPath(rootDir: string): string {
   for (const filename of PLUGIN_MANIFEST_FILENAMES) {
     const candidate = path.join(rootDir, filename);
@@ -41,20 +62,38 @@ export function resolvePluginManifestPath(rootDir: string): string {
   return path.join(rootDir, PLUGIN_MANIFEST_FILENAME);
 }
 
-export function loadPluginManifest(rootDir: string): PluginManifestLoadResult {
+export function loadPluginManifest(
+  rootDir: string,
+  rejectHardlinks = true,
+): PluginManifestLoadResult {
   const manifestPath = resolvePluginManifestPath(rootDir);
-  if (!fs.existsSync(manifestPath)) {
-    return { ok: false, error: `plugin manifest not found: ${manifestPath}`, manifestPath };
+  const opened = openBoundaryFileSync({
+    absolutePath: manifestPath,
+    rootPath: rootDir,
+    boundaryLabel: "plugin root",
+    rejectHardlinks,
+  });
+  if (!opened.ok) {
+    if (opened.reason === "path") {
+      return { ok: false, error: `plugin manifest not found: ${manifestPath}`, manifestPath };
+    }
+    return {
+      ok: false,
+      error: `unsafe plugin manifest path: ${manifestPath} (${opened.reason})`,
+      manifestPath,
+    };
   }
   let raw: unknown;
   try {
-    raw = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as unknown;
+    raw = JSON.parse(fs.readFileSync(opened.fd, "utf-8")) as unknown;
   } catch (err) {
     return {
       ok: false,
       error: `failed to parse plugin manifest: ${String(err)}`,
       manifestPath,
     };
+  } finally {
+    fs.closeSync(opened.fd);
   }
   if (!isRecord(raw)) {
     return { ok: false, error: "plugin manifest must be an object", manifestPath };
@@ -74,6 +113,7 @@ export function loadPluginManifest(rootDir: string): PluginManifestLoadResult {
   const version = typeof raw.version === "string" ? raw.version.trim() : undefined;
   const channels = normalizeStringList(raw.channels);
   const providers = normalizeStringList(raw.providers);
+  const providerAuthEnvVars = normalizeStringListRecord(raw.providerAuthEnvVars);
   const skills = normalizeStringList(raw.skills);
 
   let uiHints: Record<string, PluginConfigUiHint> | undefined;
@@ -89,6 +129,7 @@ export function loadPluginManifest(rootDir: string): PluginManifestLoadResult {
       kind,
       channels,
       providers,
+      providerAuthEnvVars,
       skills,
       name,
       description,
@@ -129,9 +170,22 @@ export type PluginPackageInstall = {
 
 export type OpenClawPackageManifest = {
   extensions?: string[];
+  setupEntry?: string;
   channel?: PluginPackageChannel;
   install?: PluginPackageInstall;
 };
+
+export const DEFAULT_PLUGIN_ENTRY_CANDIDATES = [
+  "index.ts",
+  "index.js",
+  "index.mjs",
+  "index.cjs",
+] as const;
+
+export type PackageExtensionResolution =
+  | { status: "ok"; entries: string[] }
+  | { status: "missing"; entries: [] }
+  | { status: "empty"; entries: [] };
 
 export type ManifestKey = typeof MANIFEST_KEY;
 
@@ -148,4 +202,20 @@ export function getPackageManifestMetadata(
     return undefined;
   }
   return manifest[MANIFEST_KEY];
+}
+
+export function resolvePackageExtensionEntries(
+  manifest: PackageManifest | undefined,
+): PackageExtensionResolution {
+  const raw = getPackageManifestMetadata(manifest)?.extensions;
+  if (!Array.isArray(raw)) {
+    return { status: "missing", entries: [] };
+  }
+  const entries = raw
+    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+    .filter(Boolean);
+  if (entries.length === 0) {
+    return { status: "empty", entries: [] };
+  }
+  return { status: "ok", entries };
 }
